@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="uz">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>360° Panorama — Silliq</title>
+  <style>
+    html,body{height:100%;margin:0}
+    canvas{display:block}/* Tooltip */
+#info{
+  position:fixed;
+  left:50%;
+  transform:translateX(-50%);
+  bottom:24px;
+  background:rgba(0,0,0,0.6);
+  color:#fff;padding:8px 14px;border-radius:10px;font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter;opacity:0;transition:opacity .18s,transform .18s;pointer-events:none;backdrop-filter:blur(4px)
+}
+
+/* Preloader overlay */
+#loader{
+  position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#111;color:#fff;font-family:Inter,system-ui;padding:20px;z-index:10;flex-direction:column
+}
+#loader .bar{width:240px;height:8px;background:rgba(255,255,255,0.08);border-radius:999px;overflow:hidden;margin-top:12px}
+#loader .bar > i{display:block;height:100%;width:0;background:linear-gradient(90deg,rgba(255,255,255,0.14),rgba(255,255,255,0.4));border-radius:999px;transition:width .3s}
+
+/* Small instruct */
+#hint{position:fixed;left:12px;top:12px;background:rgba(255,255,255,0.06);padding:8px 10px;border-radius:8px;color:#ddd;font-size:13px}
+
+  </style>
+</head>
+<body>
+  <div id="loader">
+    <div style="font-size:16px">Loading panorama…</div>
+    <div class="bar"><i id="bar"></i></div>
+    <div style="font-size:12px;opacity:.7;margin-top:8px">Scroll to zoom • Drag / touch to look around</div>
+  </div>  <div id="hint">Drag or touch to look • Wheel to zoom</div>
+  <div id="info"></div>  <script src="https://cdn.jsdelivr.net/npm/three@0.155.0/build/three.min.js"></script>  <script>
+    // === Config ===
+    const PANO_URL = 'https://i.imgur.com/jevL9av.jpg';
+    const STENCIL_URL = 'https://i.imgur.com/NUKbrbl.png';
+
+    // === Basic three.js setup ===
+    const renderer = new THREE.WebGLRenderer({antialias:true});
+    renderer.setPixelRatio(window.devicePixelRatio || 1);
+    renderer.setSize(innerWidth, innerHeight);
+    document.body.appendChild(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.1, 2000);
+    camera.position.set(0,0,0.01);
+
+    // sphere
+    const sphereGeo = new THREE.SphereGeometry(500, 64, 64);
+    sphereGeo.scale(-1,1,1);
+
+    const loader = new THREE.TextureLoader();
+    loader.crossOrigin = '';
+
+    const panoTex = loader.load(PANO_URL, onResourceLoaded, undefined, onResourceError);
+
+    const sphereMat = new THREE.MeshBasicMaterial({map: panoTex});
+    const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+    scene.add(sphere);
+
+    // stencil canvas (offscreen) to read pixel colors
+    const stencilImg = new Image();
+    stencilImg.crossOrigin = 'anonymous';
+    stencilImg.src = STENCIL_URL;
+
+    const stencilCanvas = document.createElement('canvas');
+    const stencilCtx = stencilCanvas.getContext('2d');
+    let stencilData = null;
+
+    stencilImg.onload = () => {
+      stencilCanvas.width = stencilImg.width;
+      stencilCanvas.height = stencilImg.height;
+      stencilCtx.drawImage(stencilImg,0,0);
+      stencilData = stencilCtx.getImageData(0,0,stencilImg.width,stencilImg.height).data;
+      onResourceLoaded();
+    }
+
+    stencilImg.onerror = onResourceError;
+
+    // simple loading manager counting two resources (pano + stencil)
+    let toLoad = 2;
+    const bar = document.getElementById('bar');
+    function onResourceLoaded(){
+      toLoad = Math.max(0, toLoad-1);
+      const pct = (2 - toLoad)/2;
+      bar.style.width = Math.round(pct*100) + '%';
+      if(toLoad===0) finishLoading();
+    }
+    function onResourceError(err){
+      console.error('resource failed', err);
+      finishLoading();
+    }
+
+    function finishLoading(){
+      const loaderEl = document.getElementById('loader');
+      loaderEl.style.transition = 'opacity .5s, transform .5s';
+      loaderEl.style.opacity = 0;
+      loaderEl.style.transform = 'scale(.98)';
+      setTimeout(()=>loaderEl.remove(),600);
+    }
+
+    // === interaction & smoothing ===
+    let isDown = false;
+    let lastX = 0, lastY = 0;
+    let lon = 0, lat = 0;
+    let targetLon = 0, targetLat = 0;
+    let inertiaX = 0, inertiaY = 0;
+
+    // zoom smoothing
+    let fov = 75, targetFov = 75;
+    const minFov = 30, maxFov = 110;
+
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+    const info = document.getElementById('info');
+
+    // color -> label map (matches stencil PNG colors)
+    const objects = {
+      '255,0,0': 'Socket 1',
+      '245,0,0': 'Socket 2',
+      '235,0,0': 'Window 1',
+      '225,0,0': 'Window 2'
+    };
+
+    // Helpers to get pointer coords (works for mouse and touch)
+    function getPointerXY(e){
+      if(e.touches && e.touches[0]) return {x: e.touches[0].clientX, y: e.touches[0].clientY};
+      return {x: e.clientX, y: e.clientY};
+    }
+
+    function onPointerDown(e){
+      isDown = true;
+      const p = getPointerXY(e);
+      lastX = p.x; lastY = p.y;
+      e.preventDefault();
+    }
+    function onPointerMove(e){
+      const p = getPointerXY(e);
+      if(isDown){
+        const dx = p.x - lastX;
+        const dy = p.y - lastY;
+        targetLon -= dx * 0.12;
+        targetLat += dy * 0.12;
+        inertiaX = dx; inertiaY = dy;
+        lastX = p.x; lastY = p.y;
+      }
+      // always update hover raycast for info
+      raycastAt(p.x, p.y);
+    }
+    function onPointerUp(e){ isDown = false; }
+
+    function onWheel(e){
+      const delta = e.deltaY || e.wheelDelta;
+      targetFov += delta * 0.02;
+      targetFov = Math.max(minFov, Math.min(maxFov, targetFov));
+      e.preventDefault();
+    }
+
+    function raycastAt(px, py){
+      if(!stencilData) return;
+      mouse.x = (px / innerWidth) * 2 - 1;
+      mouse.y = -(py / innerHeight) * 2 + 1;
+      raycaster.setFromCamera(mouse, camera);
+      const hit = raycaster.intersectObject(sphere)[0];
+      if(!hit){ info.style.opacity = 0; return; }
+      const uv = hit.uv;
+      // uv.x ranges 0..1 left->right; uv.y 0..1 bottom->top for sphere intersects
+      const ix = Math.floor(uv.x * stencilImg.width);
+      const iy = Math.floor((1 - uv.y) * stencilImg.height);
+      const idx = (iy * stencilImg.width + ix) * 4;
+      const r = stencilData[idx], g = stencilData[idx+1], b = stencilData[idx+2];
+      const label = objects[f"{r},{g},{b}".replace(/\s/g,'')];
+      if(label){ info.textContent = label; info.style.opacity = 1; info.style.transform = 'translateX(-50%) translateY(0)'; }
+      else { info.style.opacity = 0; }
+    }
+
+    // events
+    window.addEventListener('mousedown', onPointerDown, {passive:false});
+    window.addEventListener('mousemove', onPointerMove);
+    window.addEventListener('mouseup', onPointerUp);
+
+    window.addEventListener('touchstart', onPointerDown, {passive:false});
+    window.addEventListener('touchmove', onPointerMove, {passive:false});
+    window.addEventListener('touchend', onPointerUp);
+
+    window.addEventListener('wheel', onWheel, {passive:false});
+
+    // resize
+    window.addEventListener('resize', ()=>{
+      camera.aspect = innerWidth/innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    // animation loop with smoothing
+    function animate(){
+      requestAnimationFrame(animate);
+
+      // inertia when not dragging
+      if(!isDown){
+        targetLon -= inertiaX * 0.03;
+        targetLat += inertiaY * 0.03;
+        inertiaX *= 0.92; inertiaY *= 0.92;
+      }
+
+      // lerp
+      lon += (targetLon - lon) * 0.09;
+      lat += (targetLat - lat) * 0.09;
+      lat = Math.max(-85, Math.min(85, lat));
+
+      // convert to spherical coords
+      const phi = THREE.MathUtils.degToRad(90 - lat);
+      const theta = THREE.MathUtils.degToRad(lon);
+      const x = 500 * Math.sin(phi) * Math.cos(theta);
+      const y = 500 * Math.cos(phi);
+      const z = 500 * Math.sin(phi) * Math.sin(theta);
+      camera.lookAt(x,y,z);
+
+      // smooth fov
+      fov += (targetFov - fov) * 0.09;
+      camera.fov = fov; camera.updateProjectionMatrix();
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    // small accessibility: allow keyboard arrows
+    window.addEventListener('keydown', (e)=>{
+      if(e.key === 'ArrowLeft') targetLon -= 10;
+      if(e.key === 'ArrowRight') targetLon += 10;
+      if(e.key === 'ArrowUp') targetLat += 6;
+      if(e.key === 'ArrowDown') targetLat -= 6;
+    });
+
+    // prevent context menu on long-press
+    window.addEventListener('contextmenu', (e)=>e.preventDefault());
+
+  </script></body>
+</html>
